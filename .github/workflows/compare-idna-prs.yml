@@ -1,0 +1,93 @@
+name: Compare idna PR 279 and 287 (actual commits)
+
+on:
+  push:
+    branches:
+      - research/279-vs-287-benchmark
+    paths:
+      - research/compare_idna.py
+      - .github/workflows/compare-idna-prs.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.13"
+          - os: ubuntu-22.04
+            python: "3.12"
+          - os: macos-15
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Construct pinned real-commit variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=7c55529db07b94781037703199f57fc9b7c0dc40
+          OURS=ebaaa7175134bb9247e19ebf177e51356e897a17
+          THEIRS=4367172084872ef951a2485af332ac55ec7b65e4
+          ROOT="$RUNNER_TEMP/idna-worktrees"
+          mkdir -p "$ROOT"
+
+          git fetch --no-tags https://github.com/kjd/idna.git refs/pull/287/head
+          test "$(git rev-parse FETCH_HEAD)" = "$THEIRS"
+          git rev-parse --verify "$BASE^{commit}"
+          git rev-parse --verify "$OURS^{commit}"
+          git worktree add --detach "$ROOT/base" "$BASE"
+          git worktree add --detach "$ROOT/pr279" "$OURS"
+          git worktree add --detach "$ROOT/pr287" "$THEIRS"
+          git worktree add --detach "$ROOT/combined" "$THEIRS"
+          git diff "$BASE" "$OURS" -- idna/core.py tests/test_idna.py > "$ROOT/279.patch"
+          git -C "$ROOT/combined" apply --check "$ROOT/279.patch"
+          git -C "$ROOT/combined" apply "$ROOT/279.patch"
+          git -C "$ROOT/combined" diff --check
+          printf 'IDNA_WORKTREE_ROOT=%s\n' "$ROOT" >> "$GITHUB_ENV"
+          echo "All variants pinned and combined patch cleanly applied."
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check pytest hypothesis
+
+      - name: Run upstream regression suite on each variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variant in base pr279 pr287 combined; do
+            echo "::group::Full suite: $variant"
+            (cd "$IDNA_WORKTREE_ROOT/$variant" && python -m pytest -q tests)
+            echo "::endgroup::"
+          done
+
+      - name: Run differential validation and paired benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          export IDNA_REPORT_PATH="results/${{ matrix.os }}-py${{ matrix.python }}.json"
+          python research/compare_idna.py "$IDNA_WORKTREE_ROOT"
+
+      - name: Publish raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idna-comparison-${{ matrix.os }}-py${{ matrix.python }}
+          path: results/
+          if-no-files-found: warn
+          retention-days: 30
